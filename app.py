@@ -33,7 +33,8 @@ HTML = r"""
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title> Luna </title>
-    <link rel="icon" type="image/png" href="/favicon.png?v=2">
+    <link rel="icon" type="image/png"
+        href="{{ url_for('static', filename='favicon.png') }}?v=3">
     <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
     <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=Noto+Sans+TC:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
@@ -478,7 +479,7 @@ button:disabled {
 <body>
 <div class="app">
     <header class="luna-header">    
-    
+
 <div class="luna-icon">
     <span id="luna-expression">☾</span>
 </div>
