@@ -1036,8 +1036,25 @@ def verify_supabase_token(token):
     except requests.RequestException:
         app.logger.exception("Supabase token verification failed")
         return None, "無法連線至 Supabase，請稍後再試。", 503
-
-
+    
+def save_message(user_id, token, role, content):
+    """保存一則聊天訊息到 Supabase。"""
+    response = requests.post(
+        f"{supabase_url}/rest/v1/luna_messages",
+        headers={
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        },
+        json={
+            "user_id": user_id,
+            "role": role,
+            "content": content,
+        },
+        timeout=10,
+    )
+    response.raise_for_status()
 
 def save_memory(user_id, token, memory, category="general"):
     """保存一筆小月的長期記憶。"""
