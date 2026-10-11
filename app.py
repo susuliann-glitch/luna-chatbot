@@ -8,6 +8,57 @@ from google.genai import errors
 from flask import send_from_directory
 
 app = Flask(__name__)
+
+MODEL_FALLBACKS = [
+    "gemini-3.5-flash-lite",  # 主要模型
+    "gemini-3.6-flash",       # 備用模型 1
+    "gemini-3.8-flash",       # 備用模型 2
+]
+
+def generate_with_fallback(contents, system_instruction):
+    last_error = None
+
+    for model_name in MODEL_FALLBACKS:
+        try:
+            app.logger.info("Trying Gemini model: %s", model_name)
+
+            response = client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    response_mime_type="application/json",
+                ),
+            )
+
+            return response
+
+        except errors.APIError as e:
+            error_text = str(e).lower()
+            status_code = getattr(e, "code", None)
+
+            # 只有額度限制或暫時性服務問題才嘗試下一個模型
+            should_fallback = (
+                status_code in (429, 500, 502, 503, 504)
+                or "resource_exhausted" in error_text
+                or "quota" in error_text
+            )
+
+            if not should_fallback:
+                raise
+
+            last_error = e
+            app.logger.warning(
+                "Model %s unavailable; trying fallback. Error: %s",
+                model_name,
+                e,
+            )
+
+    if last_error:
+        raise last_error
+
+    raise RuntimeError("No Gemini models configured")
+
 @app.route("/favicon.png")
 def favicon():
     return send_from_directory(
@@ -24,7 +75,6 @@ client = genai.Client(api_key=api_key) if api_key else None
 
 print("Luna Gemini 已設定：", bool(client))
 print("Luna Supabase 已設定：", bool(supabase_url and supabase_key))
-
 
 HTML = r"""
 <!DOCTYPE html>
@@ -1348,13 +1398,9 @@ reply 必須保留小月原本的繁體中文與個性。
 """
 
     try:
-        response = client.models.generate_content(
-            model="gemini-3.8-flash",
+        response = generate_with_fallback(
             contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    response_mime_type="application/json",
-                ),
+           system_instruction=system_instruction,
         )
 
         result = json.loads(response.text or "{}")
