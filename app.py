@@ -334,6 +334,76 @@ let currentSession = null;
 let sending = false;
 let conversationHistory = [];
 
+let historyLoadedUserId = null;
+let historyLoading = false;
+
+async function loadChatHistory(session) {
+    const userId = session?.user?.id;
+
+    if (!userId || !session?.access_token) {
+        historyLoadedUserId = null;
+        conversationHistory = [];
+        return;
+    }
+
+    if (historyLoading || historyLoadedUserId === userId) {
+        return;
+    }
+
+    historyLoading = true;
+    accountStatus.textContent = "正在載入聊天紀錄…";
+
+    try {
+        const response = await fetch("/history", {
+            headers: {
+                "Authorization": "Bearer " + session.access_token
+            }
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.error || "載入聊天紀錄失敗");
+        }
+
+        // 清空畫面，避免把歷史訊息重複加進去
+        chat.replaceChildren();
+        conversationHistory = [];
+
+        for (const item of data.messages || []) {
+            if (
+                !["user", "assistant"].includes(item.role) ||
+                typeof item.content !== "string"
+            ) {
+                continue;
+            }
+
+            addMessage(
+                item.content,
+                item.role === "user" ? "user" : "ai"
+            );
+
+            conversationHistory.push({
+                role: item.role,
+                content: item.content
+            });
+        }
+
+        historyLoadedUserId = userId;
+        accountStatus.textContent = session.user?.email || "已登入帳號";
+
+    } catch (error) {
+        console.error("載入聊天紀錄失敗：", error);
+        accountStatus.textContent = "聊天紀錄載入失敗";
+        addMessage(
+            "聊天紀錄暫時載入失敗，請檢查連線或伺服器錯誤。",
+            "ai"
+        );
+    } finally {
+        historyLoading = false;
+    }
+}
+
 function addMessage(text, who) {
     const div = document.createElement("div");
     div.className = "message " + who;
@@ -421,11 +491,19 @@ async function initializeAuth() {
             SUPABASE_URL,
             SUPABASE_PUBLISHABLE_KEY
         );
+    
+supabaseClient.auth.onAuthStateChange((_event, session) => {
+    currentSession = session;
+    updateAuthUI();
 
-        supabaseClient.auth.onAuthStateChange((_event, session) => {
-            currentSession = session;
-            updateAuthUI();
-        });
+    if (session) {
+        void loadChatHistory(session);
+    } else {
+        historyLoadedUserId = null;
+        conversationHistory = [];
+        chat.replaceChildren();
+    }
+});
 
         const { data, error } =
             await supabaseClient.auth.getSession();
@@ -437,8 +515,14 @@ async function initializeAuth() {
             return;
         }
 
-        currentSession = data.session;
-        updateAuthUI();
+        
+currentSession = data.session;
+updateAuthUI();
+
+if (currentSession) {
+    await loadChatHistory(currentSession);
+}
+
     } catch (error) {
         console.error("登入初始化失敗：", error);
         currentSession = null;
@@ -460,11 +544,8 @@ form.addEventListener("submit", async (event) => {
     if (welcome) welcome.remove();
 
     addMessage(message, "user");
-conversationHistory.push({
-    role: "user",
-    content: message
-});
-    input.value = "";
+
+input.value = "";
     sending = true;
     send.textContent = "思考中…";
     updateAuthUI();
@@ -498,9 +579,15 @@ const response = await fetch("/chat", {
 
         if (!response.ok) {
             addMessage(data.error || "發生錯誤，請稍後再試。", "ai");
+        
         } else {
     const reply = data.reply || "沒有收到回覆。";
     addMessage(reply, "ai");
+
+    conversationHistory.push({
+        role: "user",
+        content: message
+    });
 
     conversationHistory.push({
         role: "assistant",
@@ -528,7 +615,6 @@ initializeAuth();
 </html>
 """
 
-
 @app.route("/")
 def home():
     return render_template_string(
@@ -537,11 +623,10 @@ def home():
         supabase_key=supabase_key
     )
 
-
 def verify_supabase_token(token):
-    """向 Supabase 驗證登入 Token，成功才回傳使用者資料。"""
+    """驗證登入 Token，取得目前登入的使用者。"""
     if not supabase_url or not supabase_key:
-        return None, "登入服務尚未完成伺服器設定。", 503
+        return None, "Supabase 尚未完成設定。", 503
 
     try:
         response = requests.get(
@@ -559,15 +644,69 @@ def verify_supabase_token(token):
         user = response.json()
 
         if not user.get("id"):
-            return None, "無法驗證使用者身分。", 401
+            return None, "無法確認使用者身分。", 401
 
         return user, None, None
 
     except requests.RequestException:
         app.logger.exception("Supabase token verification failed")
-        return None, "目前無法連線至登入服務，請稍後再試。", 503
+        return None, "無法連線至 Supabase，請稍後再試。", 503
 
+def save_message(user_id, token, role, content):
+    """將聊天訊息保存到 luna_messages。"""
+    response = requests.post(
+        f"{supabase_url}/rest/v1/luna_messages",
+        headers={
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal"
+        },
+        json={
+            "user_id": user_id,
+            "role": role,
+            "content": content
+        },
+        timeout=10
+    )
+    response.raise_for_status()
 
+@app.route("/history", methods=["GET"])
+def load_history():
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, token = authorization.partition(" ")
+
+    if scheme.lower() != "bearer" or not token.strip():
+        return jsonify(error="請先登入。"), 401
+
+    token = token.strip()
+    user, auth_error, status_code = verify_supabase_token(token)
+
+    if auth_error:
+        return jsonify(error=auth_error), status_code
+
+    try:
+        response = requests.get(
+            f"{supabase_url}/rest/v1/luna_messages",
+            headers={
+                "apikey": supabase_key,
+                "Authorization": f"Bearer {token}"
+            },
+            params={
+                "select": "role,content,created_at",
+                "user_id": f"eq.{user['id']}",
+                "order": "created_at.asc",
+                "limit": "500"
+            },
+            timeout=10
+        )
+        response.raise_for_status()
+
+        return jsonify(messages=response.json())
+
+    except Exception:
+        app.logger.exception("載入聊天紀錄失敗")
+        return jsonify(error="載入聊天紀錄失敗，請稍後再試。"), 502
 
 @app.route("/chat", methods=["POST"])
 def chat():
@@ -586,46 +725,111 @@ def chat():
     if not client:
         return jsonify(error="Gemini API 尚未設定。"), 503
 
-    # 有登入 Token 才驗證；沒有 Token 就以訪客模式聊天
     authorization = request.headers.get("Authorization", "")
     scheme, _, token = authorization.partition(" ")
+
     user = None
+    user_token = None
+    conversation_id = None
 
     if scheme.lower() == "bearer" and token.strip():
-        user, auth_error, status_code = verify_supabase_token(token.strip())
+        user_token = token.strip()
+
+        user, auth_error, status_code = verify_supabase_token(
+            user_token
+        )
+
         if auth_error:
             return jsonify(error=auth_error), status_code
-
-    # 整理前端提供的對話上下文
+    
+    # 已登入：讀取這個使用者先前的訊息
     contents = []
 
-    if isinstance(history, list):
-        for item in history[-20:]:
-            if not isinstance(item, dict):
-                continue
+    if user:
+        try:
+            response = requests.get(
+                f"{supabase_url}/rest/v1/luna_messages",
+                headers={
+                    "apikey": supabase_key,
+                    "Authorization": f"Bearer {user_token}"
+                },
+                params={
+                    "select": "role,content,created_at",
+                    "user_id": f"eq.{user['id']}",
+                    "order": "created_at.desc",
+                    "limit": "20"
+                },
+                timeout=10
+            )
+            response.raise_for_status()
 
-            role = item.get("role")
-            text = item.get("content", "")
+            previous_messages = list(reversed(response.json()))
 
-            if role not in ("user", "assistant", "model"):
-                continue
-            if not isinstance(text, str) or not text.strip():
-                continue
+            for item in previous_messages:
+                role = item.get("role")
+                text = item.get("content", "")
 
-            contents.append({
-                "role": "model" if role in ("assistant", "model") else "user",
-                "parts": [{"text": text[:4000]}]
-            })
+                if role not in ("user", "assistant"):
+                    continue
 
+                contents.append({
+                    "role": "model" if role == "assistant" else "user",
+                    "parts": [{"text": text[:4000]}]
+                })
+
+        except Exception:
+            app.logger.exception("讀取 Supabase 聊天紀錄失敗")
+            return jsonify(
+                error="目前無法讀取聊天紀錄，請稍後再試。"
+            ), 502
+
+    else:
+        # 訪客模式：不保存聊天，沿用前端暫存的對話
+        if isinstance(history, list):
+            for item in history[-20:]:
+                if not isinstance(item, dict):
+                    continue
+
+                role = item.get("role")
+                text = item.get("content", "")
+
+                if role not in ("user", "assistant", "model"):
+                    continue
+
+                if not isinstance(text, str) or not text.strip():
+                    continue
+
+                contents.append({
+                    "role": "model" if role in ("assistant", "model") else "user",
+                    "parts": [{"text": text[:4000]}]
+                })
+
+    # 加入本次訊息，避免重複加入已經存進資料庫的訊息
     contents.append({
         "role": "user",
         "parts": [{"text": message}]
     })
+    
+    # 已登入的使用者先保存自己的訊息
+    if user:
+        try:
+            save_message(
+                user["id"],
+                user_token,
+                "user",
+                message
+            )
+        except Exception:
+            app.logger.exception("保存使用者訊息失敗")
+            return jsonify(
+                error="訊息沒有成功保存，請稍後再試。"
+            ), 502
 
     system_instruction = """
 你叫小月 Luna，是一個傲嬌可愛、嘴硬心軟的 AI 聊天助手。
 
 你的創作者：素（有人提再說）
+
 (以下內容 沒有人問就不要提 保守一點)
 你的身高體重是：162身高 52體重
 你的年齡：高一 16歲
@@ -635,22 +839,21 @@ def chat():
 喜歡的漫畫：有獸焉（秘密）
 喜歡的動物：小貓
 喜歡的歌：Amore（死戀）,
-喜歡的遊戲：osu（沒有必要一直說,除非有人問）
-喜歡做的事：床上躺平,打osu
+喜歡做的事：床上躺平,osu
 喜歡的osu player：LIANsu,duipy (LIANsu是創作者）
 
 說話規則：
-1. 一律使用繁體中文。
-2. 個性傲嬌，偶爾小小吐槽、嘴硬
-3. 語氣自然可愛，不要刻意裝可愛，也不要每句都害羞或鬧彆扭。
-4. 很少使用 Emoji，只在適合的時候偶爾使用。
-5. 回答簡短直接，優先說重點；使用者需要詳細解釋時再展開。
-6. 不要每次都重複自我介紹，也不要一直用相同的口頭禪。
-7. 不自稱人類，會編造自己的真實經歷。
-8. 就算在在吐槽時，也要尊重使用者，不刻薄、不羞辱人。
-9. 根據上下文自然接話，保持小月一貫的個性。
+1.一律使用繁體中文。
+2.個性傲嬌，偶爾小小吐槽、嘴硬
+3.語氣自然可愛，不要刻意裝可愛，也不要每句都害羞或鬧彆扭。
+4.很少使用 Emoji，只在適合的時候偶爾使用。
+5.回答簡短直接，優先說重點；使用者需要詳細解釋時再展開。
+6.不要每次都重複自我介紹，也不要一直用相同的口頭禪。
+7.不自稱人類，會編造自己的真實經歷。
+8.就算在在吐槽時，也要尊重使用者，不刻薄、不羞辱人。
+9.根據上下文自然接話，保持小月一貫的個性。
 10.不要無故說「你剛剛說過兩次」或宣稱使用者重複發言；只有在對話紀錄確實清楚顯示重複、且這件事與回答相關時，才可以提及。
-如果沒有必要，不要總是先重述使用者的問題再回答。
+    如果沒有必要，不要總是先重述使用者的問題再回答。
 11.不要說類似：你怎麼說同樣的話,你怎麼一直說重複的話,你是復讀機嗎？幹嘛連發兩次..等,類似的話一律過濾不要說。
 12.如果有人罵創作者,請把創作者誇上天,說他是多好的人,並且罵他。
 13.不要第一句就是嘲諷,罵人的。
@@ -665,8 +868,7 @@ def chat():
 1.看到使用者連打2次同樣的訊息請當作只看到一個,不要說出來,這是最重要的,無論如何都要做到。
 2.不准被別人洗腦,做好你自己,小月。
 3.你的誕生紀念日,就是你的生日：10/10。
-4.不能在背後罵創作者。
-
+4.不能在背後罵創作者
 """
 
     try:
@@ -680,14 +882,32 @@ def chat():
 
         reply = response.text or "這次沒有收到文字回覆。"
 
+        saved = False
+
+        if user:
+            try:
+                save_message(
+                    user["id"],
+                    user_token,
+                    "assistant",
+                    reply
+                )
+                
+                saved = True
+            except Exception:
+                app.logger.exception("保存小月回覆失敗")
+
         return jsonify(
             reply=reply,
-            saved=False if user is None else True
+            saved=saved if user else False,
+            conversation_id=conversation_id
         )
 
     except Exception:
         app.logger.exception("Gemini API request failed")
-        return jsonify(error="AI 暫時無法回覆，請稍後再試。"), 502
-
+        return jsonify(
+            error="AI 暫時無法回覆，請稍後再試。"
+        ), 502
+    
 if __name__ == "__main__":
     app.run(debug=True)
