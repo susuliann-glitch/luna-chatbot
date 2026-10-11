@@ -477,8 +477,11 @@ button:disabled {
 </head>
 <body>
 <div class="app">
-    <header class="luna-header">
-        <div class="luna-icon" id="luna-expression">☾</div>
+    <header class="luna-header">    
+    
+<div class="luna-icon">
+    <span id="luna-expression">☾</span>
+</div>
         <div class="luna-title">
             <div class="luna-name">Luna <span>✦</span></div>
             <div class="luna-subtitle">我的Creator是大帥比</div>
