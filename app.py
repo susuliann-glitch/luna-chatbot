@@ -1400,6 +1400,71 @@ def save_message(user_id, token, role, content):
     )
     response.raise_for_status()
 
+@app.route("/history", methods=["GET"])
+def history():
+    """讀取目前登入使用者的聊天紀錄。"""
+
+    authorization = request.headers.get("Authorization", "")
+    scheme, _, token = authorization.partition(" ")
+
+    if scheme.lower() != "bearer" or not token.strip():
+        return jsonify(error="請先登入後再載入聊天紀錄。"), 401
+
+    token = token.strip()
+
+    # 驗證登入身分，避免讀取其他使用者的紀錄
+    user, auth_error, status_code = verify_supabase_token(token)
+
+    if auth_error:
+        return jsonify(error=auth_error), status_code
+
+    try:
+        response = requests.get(
+            f"{supabase_url}/rest/v1/luna_messages",
+            headers={
+                "apikey": supabase_key,
+                "Authorization": f"Bearer {token}",
+            },
+            params={
+                "select": "role,content,created_at",
+                "user_id": f"eq.{user['id']}",
+                "order": "created_at.desc",
+                "limit": "200",
+            },
+            timeout=10,
+        )
+
+        if not response.ok:
+            app.logger.error(
+                "讀取聊天紀錄失敗：HTTP %s，回應：%s",
+                response.status_code,
+                response.text[:1000],
+            )
+            return jsonify(
+                error="目前無法讀取聊天紀錄，請稍後再試。"
+            ), 502
+
+        messages = response.json()
+
+        if not isinstance(messages, list):
+            app.logger.error("聊天紀錄格式不正確")
+            return jsonify(error="聊天紀錄格式不正確。"), 502
+
+        # 資料庫以新到舊取得最近 200 則，前端需要舊到新
+        messages.reverse()
+
+        return jsonify(messages=messages)
+
+    except requests.RequestException:
+        app.logger.exception("讀取 Supabase 聊天紀錄時發生連線錯誤")
+        return jsonify(
+            error="目前無法連線至聊天紀錄資料庫，請稍後再試。"
+        ), 502
+
+    except (ValueError, TypeError):
+        app.logger.exception("聊天紀錄資料解析失敗")
+        return jsonify(error="聊天紀錄資料格式錯誤。"), 502
+
 def save_memory(user_id, token, memory, category="general"):
     """保存一筆小月的長期記憶。"""
     response = requests.post(
