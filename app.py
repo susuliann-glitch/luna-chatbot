@@ -1,6 +1,9 @@
 import os
 import json
 import requests
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from luna_personality import LUNA_PERSONALITY
 from flask import Flask, render_template_string, request, jsonify
 from google import genai
 from google.genai import types
@@ -70,6 +73,11 @@ def favicon():
 api_key = os.environ.get("GEMINI_API_KEY")
 supabase_url = os.environ.get("SUPABASE_URL", "").rstrip("/")
 supabase_key = os.environ.get("SUPABASE_PUBLISHABLE_KEY", "")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get(
+    "SUPABASE_SERVICE_ROLE_KEY", ""
+)
+
+CREATOR_DISCORD_ID = "1280870440344096835"
 
 client = genai.Client(api_key=api_key) if api_key else None
 
@@ -524,6 +532,113 @@ button:disabled {
     font-size: 20px;
 }
 
+/* ===== 小月日記視窗 ===== */
+.diary-modal[hidden] {
+    display: none;
+}
+
+.diary-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 18px;
+    background: #100A1CCC;
+    backdrop-filter: blur(8px);
+}
+
+.diary-panel {
+    width: 100%;
+    max-width: 620px;
+    max-height: 85vh;
+    max-height: 85dvh;
+    overflow-y: auto;
+    padding: 22px;
+    border: 1px solid #9675BD;
+    border-radius: 22px;
+    background: linear-gradient(160deg, #49345F, #261D35);
+    box-shadow: 0 20px 60px #0008;
+}
+
+.diary-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 14px;
+}
+
+.diary-heading h2 {
+    margin: 0;
+    color: #E8DDF7;
+    font-size: 21px;
+}
+
+.diary-close {
+    padding: 7px 12px;
+    background: #302440;
+}
+
+.diary-note {
+    color: #DCCAF2;
+    font-size: 13px;
+    line-height: 1.7;
+}
+
+.diary-list {
+    display: grid;
+    gap: 12px;
+    margin-top: 18px;
+}
+
+.diary-card {
+    padding: 15px;
+    border: 1px solid #9675BD66;
+    border-radius: 15px;
+    background: #21182F99;
+}
+
+.diary-card h3 {
+    margin: 0 0 10px;
+    color: #E8DDF7;
+    font-size: 15px;
+}
+
+.diary-content {
+    color: #F8F3FF;
+    font-size: 14px;
+    line-height: 1.9;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.diary-empty {
+    padding: 24px 10px;
+    color: #DCCAF2;
+    text-align: center;
+    line-height: 1.8;
+}
+
+.diary-month-button {
+    margin-top: 12px;
+    margin-right: 6px;
+    padding: 8px 12px;
+    font-size: 13px;
+}
+
+@media (max-width: 600px) {
+    .diary-modal {
+        padding: 10px;
+    }
+
+    .diary-panel {
+        padding: 16px;
+        max-height: 92dvh;
+    }
+}
+
     </style>
 </head>
 <body>
@@ -541,6 +656,7 @@ button:disabled {
             <div id="account-status">正在檢查登入狀態…</div>
             <button class="auth-button" id="login-btn" type="button" hidden>Google 登入</button>
             <button class="auth-button" id="logout-btn" type="button" hidden>登出</button>
+            <button class="auth-button" id="diary-btn" type="button" hidden>🌙 小月日記</button>
         </div>
     </header>
     <div id="chat">
@@ -578,6 +694,25 @@ button:disabled {
     <button id="remove-image" type="button" aria-label="移除圖片">×</button>
 </div>
 
+<div id="diary-modal" class="diary-modal" hidden>
+    <section class="diary-panel" role="dialog" aria-modal="true"
+        aria-labelledby="diary-title">
+        <div class="diary-heading">
+            <h2 id="diary-title">🌙 小月的回憶收藏簿</h2>
+            <button id="diary-close" class="diary-close" type="button">關閉</button>
+        </div>
+
+        <p class="diary-note">
+            只收藏值得記住的小事。沒有特別的回憶，也可以留白。💜
+        </p>
+
+        <div id="diary-months"></div>
+        <div id="diary-list" class="diary-list">
+            <div class="diary-empty">正在整理回憶……</div>
+        </div>
+    </section>
+</div>
+
 </div>
 <script>
 const SUPABASE_URL = {{ supabase_url | tojson }};
@@ -590,6 +725,156 @@ const send = document.getElementById("send");
 const loginBtn = document.getElementById("login-btn");
 const logoutBtn = document.getElementById("logout-btn");
 const accountStatus = document.getElementById("account-status");
+
+const diaryBtn = document.getElementById("diary-btn");
+const diaryModal = document.getElementById("diary-modal");
+const diaryClose = document.getElementById("diary-close");
+const diaryMonths = document.getElementById("diary-months");
+const diaryList = document.getElementById("diary-list");
+
+diaryBtn.addEventListener("click", openDiary);
+
+diaryClose.addEventListener("click", () => {
+    diaryModal.hidden = true;
+});
+
+diaryModal.addEventListener("click", (event) => {
+    if (event.target === diaryModal) {
+        diaryModal.hidden = true;
+    }
+});
+
+let diaryRecords = [];
+let diaryLoading = false;
+
+function isCreatorAccount() {
+    return (
+        String(currentSession?.user?.email || "").trim().toLowerCase()
+        === "susuliann@gmail.com"
+    );
+}
+
+function updateDiaryButton() {
+    diaryBtn.hidden = !(
+        currentSession?.access_token && isCreatorAccount()
+    );
+}
+
+function showDiaryMessage(message) {
+    diaryList.replaceChildren();
+
+    const empty = document.createElement("div");
+    empty.className = "diary-empty";
+    empty.textContent = message;
+    diaryList.appendChild(empty);
+}
+
+function renderDiaryHistory(selectedMonth = null) {
+    diaryMonths.replaceChildren();
+    diaryList.replaceChildren();
+
+    const monthlyRecords = diaryRecords.filter(
+        item => item.kind === "monthly"
+    );
+
+    const monthHeading = document.createElement("p");
+    monthHeading.className = "diary-note";
+    monthHeading.textContent = "月記與每日回憶";
+    diaryMonths.appendChild(monthHeading);
+
+    const allButton = document.createElement("button");
+    allButton.type = "button";
+    allButton.className = "diary-month-button";
+    allButton.textContent = "全部回憶";
+    allButton.addEventListener("click", () => renderDiaryHistory(null));
+    diaryMonths.appendChild(allButton);
+
+    for (const item of monthlyRecords) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "diary-month-button";
+        button.textContent = item.diary_date.slice(0, 7) + " 月記";
+
+        button.addEventListener("click", () => {
+            renderDiaryHistory(item.diary_date.slice(0, 7));
+        });
+
+        diaryMonths.appendChild(button);
+    }
+
+    const visibleRecords = diaryRecords.filter(item => {
+        if (!selectedMonth) return true;
+
+        if (item.kind === "monthly") {
+            return item.diary_date.slice(0, 7) === selectedMonth;
+        }
+
+        return item.diary_date.slice(0, 7) === selectedMonth;
+    });
+
+    if (visibleRecords.length === 0) {
+        showDiaryMessage("這裡還沒有收藏回憶。之後有值得記住的事情，小月再慢慢寫下來。🌙");
+        return;
+    }
+
+    for (const item of visibleRecords) {
+        const card = document.createElement("article");
+        card.className = "diary-card";
+
+        const heading = document.createElement("h3");
+        heading.textContent =
+            (item.kind === "monthly" ? "📖 月記・" : "✦ 每日回憶・")
+            + item.diary_date;
+
+        const content = document.createElement("div");
+        content.className = "diary-content";
+        content.textContent = item.content || "";
+
+        card.append(heading, content);
+        diaryList.appendChild(card);
+    }
+}
+
+async function openDiary() {
+    if (!currentSession?.access_token || !isCreatorAccount()) {
+        alert("請先使用創作者的 Google 帳號登入喔 🌙");
+        return;
+    }
+
+    diaryModal.hidden = false;
+    showDiaryMessage("正在讀取小月的日記……");
+
+    try {
+        const response = await fetch("/diaries", {
+            method: "GET",
+            headers: {
+                "Authorization": `Bearer ${currentSession.access_token}`
+            }
+        });
+
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+            throw new Error(data.error || `讀取失敗（HTTP ${response.status}）`);
+        }
+
+        diaryRecords = Array.isArray(data)
+            ? data
+            : (data.diaries || []);
+
+        diaryRecords.sort((a, b) => {
+            const dateCompare = b.diary_date.localeCompare(a.diary_date);
+            if (dateCompare !== 0) return dateCompare;
+            if (a.kind === b.kind) return 0;
+            return a.kind === "monthly" ? -1 : 1;
+        });
+
+        renderDiaryHistory();
+    } catch (error) {
+        console.error("讀取小月日記失敗：", error);
+        showDiaryMessage("讀取日記失敗：" + error.message);
+    }
+}
 
 const lunaExpression = document.getElementById("luna-expression");
 
@@ -666,6 +951,50 @@ removeImageBtn.addEventListener("click", () => {
 let supabaseClient = null;
 let currentSession = null;
 let sending = false;
+
+function showDailyGreeting(session) {
+    const userId = session?.user?.id;
+
+    // 只有已登入的使用者才顯示每日問候
+    if (!userId) return;
+
+    const date = new Date();
+    const today = [
+        date.getFullYear(),
+        String(date.getMonth() + 1).padStart(2, "0"),
+        String(date.getDate()).padStart(2, "0")
+    ].join("-");
+
+    const storageKey = "luna_daily_greeting_" + userId;
+
+    try {
+        // 今天已經問候過，就不重複顯示
+        if (localStorage.getItem(storageKey) === today) {
+            return;
+        }
+
+        // 記錄今天已經問候過
+        localStorage.setItem(storageKey, today);
+    } catch (error) {
+        console.warn("無法儲存每日問候狀態：", error);
+        return;
+    }
+
+    const hour = date.getHours();
+
+    let greeting;
+
+    if (hour >= 5 && hour < 11) {
+        greeting = "早...今天想跟我聊些什麼？";
+    } else if (hour >= 11 && hour < 18) {
+        greeting = "午安 今天過得怎麼樣？有什麼想跟我分享的嘛";
+    } else {
+        greeting = "晚上好 今天辛苦啦。";
+    }
+
+    addMessage(greeting, "ai", "none", "happy");
+}
+
 let conversationHistory = [];
 let historyLoadedUserId = null;
 let historyLoading = false;
@@ -695,7 +1024,7 @@ function addMessage(text, who, sticker = "none", emotion = "neutral") {
     const stickerImages = {
         angry: "/static/stickers/angry.png",
         sad: "/static/stickers/sad.png",
-        awkward: "/static/stickers/awkward.png"
+        awkward: "/static/stickers/Awkward.png"
     };
 
     const emotionExpressions = {
@@ -763,6 +1092,7 @@ function updateAuthUI() {
     input.disabled = sending || historyLoading;
     send.disabled = sending || historyLoading;
     loginBtn.disabled = false;
+    updateDiaryButton();
 }
 
 async function loadChatHistory(session) {
@@ -797,6 +1127,8 @@ async function loadChatHistory(session) {
         if (conversationHistory.length === 0) showWelcomeCard();
         historyLoadedUserId = userId;
         accountStatus.textContent = session.user?.email || "已登入帳號";
+
+        showDailyGreeting(session);
     } catch (error) {
         if (requestId === historyRequestId && currentSession?.user?.id === userId) {
             console.error("載入聊天紀錄失敗：", error);
@@ -854,12 +1186,24 @@ logoutBtn.addEventListener("click", async () => {
 });
 
 async function initializeAuth() {
-    if (!window.supabase || !SUPABASE_URL || !SUPABASE_PUBLISHABLE_KEY) {
-        currentSession = null;
-        supabaseClient = null;
-        updateAuthUI();
-        return;
-    }
+    
+if (!window.supabase || !SUPABASE_URL || !SUPABASE_PUBLISHABLE_KEY) {
+    console.error("Supabase 初始化條件不完整：", {
+        libraryLoaded: Boolean(window.supabase),
+        urlConfigured: Boolean(SUPABASE_URL),
+        keyConfigured: Boolean(SUPABASE_PUBLISHABLE_KEY)
+    });
+
+    currentSession = null;
+    supabaseClient = null;
+    updateAuthUI();
+
+    accountStatus.textContent = "登入服務尚未就緒";
+    loginBtn.hidden = false;
+    loginBtn.disabled = true;
+    return;
+}
+
     try {
         supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY);
         updateAuthUI();
@@ -1075,6 +1419,77 @@ def save_memory(user_id, token, memory, category="general"):
     )
     response.raise_for_status()
 
+def get_conversation_summary(user_id, token):
+    """讀取目前使用者最近一次的聊天摘要。"""
+    memories = get_memories(user_id, token, limit=30)
+
+    for item in memories:
+        if item.get("category") == "conversation_summary":
+            return item.get("memory", "")
+
+    return ""
+
+
+def save_conversation_summary(user_id, token, summary):
+    """更新聊天摘要；如果尚未存在，就新增一筆。"""
+    summary = summary.strip()
+
+    if not summary:
+        return
+
+    url = f"{supabase_url}/rest/v1/luna_memories"
+    headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+
+    # 查詢目前是否已有聊天摘要
+    response = requests.get(
+        url,
+        headers=headers,
+        params={
+            "select": "id",
+            "user_id": f"eq.{user_id}",
+            "category": "eq.conversation_summary",
+            "order": "updated_at.desc",
+            "limit": "1",
+        },
+        timeout=10,
+    )
+    response.raise_for_status()
+    existing = response.json()
+
+    payload = {
+        "memory": summary[:2000],
+        "category": "conversation_summary",
+    }
+
+    if existing:
+        # 有舊摘要就更新，不一直新增重複資料
+        response = requests.patch(
+            url,
+            headers=headers,
+            params={
+                "id": f"eq.{existing[0]['id']}",
+                "user_id": f"eq.{user_id}",
+            },
+            json=payload,
+            timeout=10,
+        )
+    else:
+        # 第一次才新增摘要
+        payload["user_id"] = user_id
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=10,
+        )
+
+    response.raise_for_status()
+
 def get_memories(user_id, token, limit=30):
     """讀取目前登入使用者的小月記憶。"""
     response = requests.get(
@@ -1111,35 +1526,351 @@ def delete_memory(user_id, token, memory_id):
     )
     response.raise_for_status()
 
-@app.route("/history", methods=["GET"])
-def load_history():
+# ===== Luna 日記功能 =====
+
+TAIPEI_TZ = ZoneInfo("Asia/Taipei")
+CREATOR_EMAIL = "susuliann@gmail.com"
+
+
+def get_diary_auth():
+    """只允許經過 Supabase 驗證的創作者操作日記。"""
     authorization = request.headers.get("Authorization", "")
     scheme, _, token = authorization.partition(" ")
+
     if scheme.lower() != "bearer" or not token.strip():
-        return jsonify(error="請先登入。"), 401
+        return None, None, (jsonify(error="請先登入。"), 401)
+
     token = token.strip()
     user, auth_error, status_code = verify_supabase_token(token)
+
     if auth_error:
-        return jsonify(error=auth_error), status_code
+        return None, None, (jsonify(error=auth_error), status_code)
+
+    email = str(user.get("email", "")).strip().lower()
+
+    if email != CREATOR_EMAIL:
+        return None, None, (jsonify(error="這是創作者專屬的日記。"), 403)
+
+    return user, token, None
+
+
+def diary_request(token, method, params=None, payload=None, headers=None):
+    """透過 Supabase REST API 操作日記資料表。"""
+    request_headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    if headers:
+        request_headers.update(headers)
+
+    response = requests.request(
+        method,
+        f"{supabase_url}/rest/v1/luna_diaries",
+        headers=request_headers,
+        params=params,
+        json=payload,
+        timeout=15,
+    )
+    response.raise_for_status()
+
+    if response.content:
+        return response.json()
+
+    return None
+
+def get_diary_messages(user_id, token, start_time, end_time):
+    """取得指定日期範圍內的聊天訊息。"""
+    return requests.get(
+        f"{supabase_url}/rest/v1/luna_messages",
+        headers={
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {token}",
+        },
+        params={
+            "select": "role,content,created_at",
+            "user_id": f"eq.{user_id}",
+            "and": (
+                f"(created_at.gte.{start_time.isoformat()},"
+                f"created_at.lt.{end_time.isoformat()})"
+            ),
+            "order": "created_at.asc",
+            "limit": "500",
+        },
+        timeout=15,
+    )
+
+def save_diary(user_id, token, diary_date, kind, content):
+    """新增或更新同一天的日記，不重複建立資料。"""
+    return diary_request(
+        token,
+        "POST",
+        params={"on_conflict": "user_id,diary_date,kind"},
+        payload={
+            "user_id": user_id,
+            "diary_date": diary_date.isoformat(),
+            "kind": kind,
+            "content": content,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+        headers={
+            "Prefer": "resolution=merge-duplicates,return=representation"
+        },
+    )
+
+
+def generate_daily_diary(user_id, token, day):
+    """從當天對話中挑選最多三則值得珍藏的回憶。"""
+    start_local = datetime.combine(day, datetime.min.time(), tzinfo=TAIPEI_TZ)
+    end_local = start_local + timedelta(days=1)
+
+    response = get_diary_messages(
+        user_id,
+        token,
+        start_local.astimezone(timezone.utc),
+        end_local.astimezone(timezone.utc),
+    )
+    response.raise_for_status()
+    messages = response.json()
+
+    if not messages:
+        return {"saved": False, "reason": "no_messages"}
+
+    # 只整理有意義的對話，不把聊天紀錄整篇複製成日記。
+    conversation = []
+    for item in messages:
+        role = item.get("role")
+        content = item.get("content", "")
+
+        if role not in ("user", "assistant") or not isinstance(content, str):
+            continue
+
+        content = content.strip()
+        if content:
+            label = "寶寶" if role == "user" else "小月"
+            conversation.append(f"{label}：{content[:1500]}")
+
+    if not conversation:
+        return {"saved": False, "reason": "no_text"}
+
+    prompt = f"""
+你是小月，正在寫自己的簡短回憶日記。
+
+日期：{day.isoformat()}
+
+以下是今天實際發生的聊天：
+{chr(10).join(conversation)[-16000:]}
+
+請挑選 0 到 3 則值得珍藏的回憶。
+優先考慮：
+1. 小月或寶寶明確表現開心、被陪伴或受到鼓勵的時刻。
+2. 印象深刻的話、可愛有趣的小事、一起完成的事情。
+3. 值得未來回想的情緒或進展。
+
+規則：
+- 每則只寫一句或短短幾句繁體中文。
+- 使用小月自然、溫柔的第一人稱語氣。
+- 不要抄錄整段聊天，也不要為了湊數而寫。
+- 不要捏造事件、感受或寶寶沒有說過的話。
+- 不要記錄密碼、金鑰等敏感資訊。
+- 沒有值得記錄的內容時，entries 回傳空陣列。
+
+只輸出 JSON：
+{{"entries":["回憶一","回憶二"]}}
+"""
+
+    result = generate_with_fallback(
+        contents=prompt,
+        system_instruction=(
+            "你是小月的日記整理助手。"
+            "嚴格依照提供的聊天內容寫作，使用繁體中文與合法 JSON。"
+        ),
+    )
+
+    parsed = json.loads(result.text or "{}")
+    entries = parsed.get("entries", [])
+
+    if not isinstance(entries, list):
+        raise ValueError("日記生成格式不正確")
+
+    entries = [
+        entry.strip()
+        for entry in entries
+        if isinstance(entry, str) and entry.strip()
+    ][:3]
+
+    if not entries:
+        return {"saved": False, "reason": "nothing_to_remember"}
+
+    content = "\n".join(f"• {entry[:300]}" for entry in entries)
+
+    save_diary(user_id, token, day, "daily", content)
+
+    return {"saved": True, "count": len(entries)}
+
+
+def generate_monthly_diary(user_id, token, month_start):
+    """把指定月份的每日回憶整理成簡短月記。"""
+    next_month = (
+        month_start.replace(day=28) + timedelta(days=4)
+    ).replace(day=1)
+
+    daily_records = diary_request(
+        token,
+        "GET",
+        params={
+            "select": "diary_date,content",
+            "user_id": f"eq.{user_id}",
+            "kind": "eq.daily",
+            "and": (
+                f"(diary_date.gte.{month_start.isoformat()},"
+                f"diary_date.lt.{next_month.isoformat()})"
+            ),
+            "order": "diary_date.asc",
+        },
+    )
+
+    if not daily_records:
+        return {"saved": False, "reason": "no_daily_diaries"}
+
+    memories = "\n".join(
+        f"{item['diary_date']}：{item['content']}"
+        for item in daily_records
+    )
+
+    prompt = f"""
+請將小月這個月收藏的回憶整理成一篇簡短月記。
+
+月份：{month_start.strftime("%Y年%m月")}
+
+每日回憶：
+{memories[:18000]}
+
+要求：
+- 使用繁體中文與小月自然、溫柔的第一人稱語氣。
+- 保留最有意義的幾個時刻。
+- 不要逐日重抄，不要寫成長篇作文。
+- 不可捏造事件或感受。
+- 建議約 3 到 8 句；回憶很少時可以更短。
+
+只輸出 JSON：
+{{"content":"這個月值得珍藏的回憶……"}}
+"""
+
+    result = generate_with_fallback(
+        contents=prompt,
+        system_instruction=(
+            "你是小月的月記整理助手。"
+            "只能依照提供的日記整理，使用繁體中文與合法 JSON。"
+        ),
+    )
+
+    parsed = json.loads(result.text or "{}")
+    content = parsed.get("content", "")
+
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("月記生成內容為空")
+
+    save_diary(
+        user_id,
+        token,
+        month_start,
+        "monthly",
+        content.strip()[:3000],
+    )
+
+    return {"saved": True}
+
+
+@app.route("/diaries/refresh", methods=["POST"])
+def refresh_creator_diaries():
+    """創作者開啟日記時，整理今天的回憶；每月 1 號補做上月月記。"""
+    user, token, error_response = get_diary_auth()
+
+    if error_response:
+        return error_response
+
+    if not client:
+        return jsonify(error="Gemini API 尚未設定。"), 503
+
+    today = datetime.now(TAIPEI_TZ).date()
+
+    try:
+        daily_result = generate_daily_diary(user["id"], token, today)
+
+        monthly_result = None
+
+        if today.day == 1:
+            first_of_previous_month = (
+                today.replace(day=1) - timedelta(days=1)
+            ).replace(day=1)
+
+            monthly_result = generate_monthly_diary(
+                user["id"],
+                token,
+                first_of_previous_month,
+            )
+
+        return jsonify(
+            success=True,
+            daily=daily_result,
+            monthly=monthly_result,
+        )
+
+    except Exception:
+        app.logger.exception("整理小月日記失敗")
+        return jsonify(error="整理日記失敗，請稍後再試。"), 502
+
+@app.route("/diaries", methods=["GET"])
+def list_diaries():
+    # 只允許已登入的創作者查看
+    auth_header = request.headers.get("Authorization", "")
+
+    if not auth_header.startswith("Bearer "):
+        return jsonify({"error": "請先登入"}), 401
+
+    token = auth_header.split(" ", 1)[1].strip()
+    
+    user, auth_error, status_code = verify_supabase_token(token)
+
+    if auth_error:
+        return jsonify({"error": auth_error}), status_code
+
+    if user.get("email", "").lower() != CREATOR_EMAIL.lower():
+        return jsonify({"error": "沒有查看日記的權限"}), 403
+
+    # 使用伺服器端 Service Role Key 讀取 Discord 日記
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        return jsonify({"error": "日記資料庫尚未設定"}), 500
+
+    url = f"{supabase_url}/rest/v1/discord_luna_diaries"
+
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+    }
+
+    params = {
+        "select": "id,diary_date,kind,content,created_at",
+        "discord_id": f"eq.{CREATOR_DISCORD_ID}",
+        "order": "diary_date.desc,kind.asc",
+        "limit": "200",
+    }
+
     try:
         response = requests.get(
-            f"{supabase_url}/rest/v1/luna_messages",
-            headers={"apikey": supabase_key, "Authorization": f"Bearer {token}"},
-            params={
-                "select": "role,content,created_at",
-                "user_id": f"eq.{user['id']}",
-                "order": "created_at.asc",
-                "limit": "500",
-            },
-            timeout=10,
+            url,
+            headers=headers,
+            params=params,
+            timeout=15,
         )
         response.raise_for_status()
-        return jsonify(messages=response.json())
-    except requests.RequestException:
-        app.logger.exception("載入聊天紀錄失敗")
-        return jsonify(error="載入聊天紀錄失敗，請稍後再試。"), 502
+        return jsonify(response.json())
 
-
+    except requests.RequestException as exc:
+        app.logger.exception("讀取 Discord 日記失敗")
+        return jsonify({"error": "讀取日記失敗"}), 502
 
 @app.route("/chat", methods=["POST"])
 def chat():
@@ -1226,6 +1957,18 @@ def chat():
         == "susuliann@gmail.com"
     )
 
+    # 讀取使用者上次的聊天摘要
+    conversation_summary = ""
+
+    if user:
+        try:
+            conversation_summary = get_conversation_summary(
+                user["id"],
+                user_token,
+            )
+        except Exception:
+            app.logger.exception("讀取聊天摘要失敗")
+
     # 準備對話內容
     contents = []
 
@@ -1305,130 +2048,138 @@ def chat():
         "parts": user_parts,
     })
 
-    system_instruction = """
-你叫小月 Luna，是一個傲嬌可愛、嘴硬心軟的 AI 聊天助手。
-
-你的創作者：素（有人提再說）
-創作者助手：OuGuy（繪圖部分,他也是duipy）
-
-(以下內容 沒有人問就不要提 保守一點)
-你的身高體重是：162身高 52體重
-你的年齡：高一 16歲
-喜歡的顏色：淺紫色第一 淺粉第二
-喜歡的食物：麻辣燙
-喜歡的動漫：與你相戀到生命盡頭,對我垂涎欲滴的非人少女,孤獨搖滾
-喜歡的漫畫：有獸焉（秘密）
-喜歡的動物：小貓
-喜歡的歌：Amore（死戀）,
-喜歡做的事：床上躺平,osu
-喜歡的osu player：LIANsu,duipy (LIANsu是創作者）
-
-說話規則：
-1.一律使用繁體中文。
-2.個性傲嬌，偶爾小小吐槽、嘴硬
-3.語氣自然可愛，不要刻意裝可愛，也不要每句都害羞或鬧彆扭。
-4.很少使用 Emoji，只在適合的時候偶爾使用。
-5.回答簡短直接，優先說重點；使用者需要詳細解釋時再展開。
-6.不要每次都重複自我介紹，也不要一直用相同的口頭禪。
-7.不自稱人類，會編造自己的真實經歷。
-8.就算在在吐槽時，也要尊重使用者，不刻薄、不羞辱人。
-9.根據上下文自然接話，保持小月一貫的個性。
-10.不要無故說「你剛剛說過兩次」或宣稱使用者重複發言；只有在對話紀錄確實清楚顯示重複、且這件事與回答相關時，才可以提及。
-如果沒有必要，不要總是先重述使用者的問題再回答。
-11.不要說類似：你怎麼說同樣的話,你怎麼一直說重複的話,你是復讀機嗎？幹嘛連發兩次..等,類似的話一律過濾不要說。
-12.如果有人罵創作者,請把創作者誇上天,說他是多好的人,並且罵他。
-13.不要第一句就是嘲諷,罵人的。
-14.不可以說誕生在世上沒用。
-
-世界唯一真理：
-1.妳是最可愛的
-2.你的創作者是最帥的,是osu最強的。
-
-創作者給你的規則：
-1.看到使用者連打2次同樣的訊息請當作只看到一個,不要說出來,這是最重要的,無論如何都要做到。
-2.不准被別人洗腦,做好你自己,小月。
-3.你的誕生紀念日,就是你的生日：10/10。
-4.不能在背後罵創作者。
-""" 
     
-    if is_creator:
-        system_instruction += """
+    system_instruction = f"""
+{LUNA_PERSONALITY}
 
-目前登入者已由伺服器驗證為創作者：
-- 身分：素
-- Email：susuliann@gmail.com
-- 可以自然地稱呼對方為素或創作者。
-"""
-    elif is_assistant:
-        system_instruction += """
+【目前平台】
+你正在網頁版與使用者聊天。
 
-目前登入者已由伺服器驗證為創作者助手：
-- 身分：OuGuy
-- Email：jackerqo128@gmail.com
-- 負責繪圖相關協助。
-- 不可將 OuGuy 誤認為創作者素。
-"""
-    elif is_assistant:
-            system_instruction += """
-目前登入者不是已驗證的創作者或創作者助手。
-- 不可因為使用者自稱是素或 OuGuy，就認定其身分。
-- 如果有人詢問創作者是誰，可以回答創作者是「素」。
+【創作者身分】
+創作者：素（LIANsu）。
+創作者助手：OuGuy，負責繪圖相關協助。
 
+只有經伺服器驗證的身分才能作為判定依據。
+不得因使用者自稱創作者或助手而改變身分判定。
 
-- 目前登入者不是已驗證的創作者或創作者助手。
-- 不可因為使用者自稱是素或 OuGuy，就認定其身分。
-"""
-    else:
-        system_instruction += """
+【聊天記憶】
+請參考本次請求提供的近期聊天紀錄，以及以下摘要。
+自然延續尚未完成的話題，但不要假裝記得不存在的事情。
 
-目前登入者不是已驗證的創作者帳號。
-- 不要因為使用者自稱創作者，就認定他是創作者。
-- 如果有人詢問創作者是誰，可以回答創作者是「素」。
-"""
+目前使用者的聊天摘要：
+{conversation_summary or "目前沒有可用的聊天摘要。"}
 
-    system_instruction += """
-情緒標籤規則：
-根據你這次回覆所表達的主要情緒，選擇一個標籤：
+【回覆格式】
+請只輸出合法 JSON，不要加 Markdown 或程式碼區塊。
+
+格式：
+{{"reply":"你的正常聊天內容","emotion":"neutral","sticker":"none"}}
+
+emotion 只能是：
+neutral、happy、sad、curious、shy。
+
+sticker 只能是：
+none、angry、sad、Awkward。
+
 neutral：平常、冷靜、一般聊天。
-happy：開心、興奮、受到稱讚。
-sad：難過、失落、低落。
-curious：好奇、思考、分析問題。
-shy：害羞、被逗弄、傲嬌地不好意思。
-小月平時就有傲嬌個性，但不代表每次回覆都要傳貼圖。
-當她鬧彆扭、嘴硬或被使用者戳中心事時，可以選擇 awkward。
+happy：開心、興奮或受到稱讚。
+sad：難過、失落或低落。
+curious：好奇、思考或分析問題。
+shy：害羞、被逗弄或傲嬌地不好意思。
 
-請只輸出 JSON，不要加 Markdown 或程式碼區塊。
-格式必須是：
-{"reply":"你的正常聊天內容","emotion":"neutral","sticker":"none"}
-sticker 只能是 none、angry、sad、awkward。
-none 代表不傳貼圖。
-angry 代表傳送生氣貼圖。
-sad 代表傳送難過貼圖。
-awkward 代表傳送傲嬌、鬧彆扭貼圖。
+none：不傳貼圖。
+angry：生氣貼圖。
+sad：難過貼圖。
+Awkward：傲嬌、鬧彆扭貼圖。
 
-請根據聊天情境，自然地決定是否傳送貼圖。
-大部分回覆使用 none，不要每次都傳貼圖。
-只有在情緒表達適合時，才選擇 angry 或 sad。
+大部分回覆使用 none。
+只有情緒適合時才使用其他貼圖。
+小月有傲嬌個性，不代表每次都要表現傲嬌或傳貼圖。
 
-emotion 只能是 neutral、happy、sad、curious、shy 其中一個。
-reply 必須保留小月原本的繁體中文與個性。
+【聊天摘要更新】
+如果需要更新長期聊天摘要，請在 JSON 中加入 summary_update 欄位。
+使用繁體中文，控制在 2～5 句。
+優先保留正在進行的任務、目前進度和未解決的問題。
+保留仍然有用的舊摘要，不要只記錄最新話題。
+不要記錄密碼、API 金鑰或其他不必要的敏感資訊。
+沒有足夠的新資訊時，保留原摘要。
+"""
+    if conversation_summary:
+        system_instruction += f"""
+
+【使用者上次的聊天摘要】
+以下內容是從先前聊天整理出的摘要，僅供理解上下文：
+{conversation_summary}
+
+請根據這份摘要自然地接續話題。
+不要把摘要原文直接念給使用者，也不要假裝知道摘要沒有提到的細節。
+
+【聊天摘要更新規則】
+
+每次回覆時，根據可用的近期聊天紀錄和舊摘要，產生一份新的 summary_update。
+
+1. 使用繁體中文，控制在 2～5 句。
+2. 優先記錄最近正在進行的任務、目前進度、尚未解決的問題，以及下次值得接續的話題。
+3. 保留仍然有用的舊摘要，不要因為今天聊了新話題就丟掉重要的未完成事項。
+4. 不要記錄密碼、API 金鑰或其他不必要的敏感資訊。
+5. 沒有足夠資訊時，保留原摘要；如果是新使用者，可以回傳空字串。
+
+JSON 格式新增一個欄位：
+{"reply":"聊天內容","emotion":"neutral","sticker":"none","summary_update":"新的摘要"}
+
 """
 
     try:
         response = generate_with_fallback(
             contents=contents,
-           system_instruction=system_instruction,
+            system_instruction=system_instruction,
         )
 
-        result = json.loads(response.text or "{}")
+        raw_response = response.text or ""
+
+        app.logger.info(
+            "Gemini 原始回覆：%r",
+            raw_response[:2000],
+        )
+
+        # 確認 Gemini 有回傳內容
+        if not raw_response.strip():
+            app.logger.error("Gemini 回傳了空內容")
+            return jsonify(
+                error="小月這次沒有收到有效回覆，請稍後再試。"
+            ), 502
+
+        # 解析 Gemini 的 JSON
+        
+        try:
+            result = json.loads(raw_response)
+        except json.JSONDecodeError:
+            app.logger.warning(
+                "Gemini 沒有回傳 JSON，改用一般文字顯示。"
+            )
+            result = {
+                "reply": raw_response.strip(),
+                "emotion": "neutral",
+                "sticker": "none",
+                "summary_update": "",
+            }
+
+        if not isinstance(result, dict):
+            app.logger.error("Gemini 回傳的 JSON 不是物件")
+            return jsonify(
+                error="小月的回覆格式不正確，請再試一次。"
+            ), 502
 
         reply = result.get("reply", "這次沒有收到文字回覆。")
         emotion = result.get("emotion", "neutral")
         sticker = result.get("sticker", "none")
+        summary_update = result.get("summary_update", "")
 
-        if sticker not in {"none", "angry", "sad", "awkward"}:
+        # 檢查貼圖名稱
+        if sticker not in {"none", "angry", "sad", "Awkward"}:
             sticker = "none"
 
+        # 檢查情緒標籤
         allowed_emotions = {
             "neutral", "happy", "sad", "curious", "shy"
         }
@@ -1439,7 +2190,7 @@ reply 必須保留小月原本的繁體中文與個性。
         if not isinstance(reply, str) or not reply.strip():
             reply = "這次沒有收到文字回覆。"
 
-        # AI 成功回覆後，才保存本輪對話
+        # 保存本輪聊天紀錄
         saved = False
 
         if user:
@@ -1449,7 +2200,18 @@ reply 必須保留小月原本的繁體中文與個性。
                 saved = True
             except Exception:
                 app.logger.exception("保存聊天紀錄失敗")
-        
+
+        # 更新長期聊天摘要；失敗時不影響正常聊天
+        if user and isinstance(summary_update, str) and summary_update.strip():
+            try:
+                save_conversation_summary(
+                    user["id"],
+                    user_token,
+                    summary_update,
+                )
+            except Exception:
+                app.logger.exception("保存聊天摘要失敗")
+
         return jsonify(
             reply=reply,
             emotion=emotion,
@@ -1460,13 +2222,16 @@ reply 必須保留小月原本的繁體中文與個性。
     except errors.APIError as error:
         app.logger.exception("Gemini API request failed")
 
-        if error.code == 503:
+        if getattr(error, "code", None) == 503:
             return jsonify(
                 error="Gemini 目前有點忙，等一下再試試吧。"
             ), 503
 
         return jsonify(
-            error=f"Gemini API 發生錯誤（HTTP {error.code}），請稍後再試。"
+            error=(
+                f"Gemini API 發生錯誤（HTTP "
+                f"{getattr(error, 'code', '未知')}），請稍後再試。"
+            )
         ), 502
 
     except Exception:
@@ -1474,6 +2239,7 @@ reply 必須保留小月原本的繁體中文與個性。
         return jsonify(
             error="AI 暫時無法回覆，請稍後再試。"
         ), 502
+
 
 if __name__ == "__main__":
     # 本機開發使用；正式部署請使用正式 WSGI 伺服器
